@@ -49,14 +49,6 @@ func (s *Scheduler) cleanUpExpired() {
 		if count > 0 {
 			log.Info().Msgf("clean up attachment %d", count)
 		}
-		count, err = api.DB(s.ctx).Envelope.Delete().Where(envelope.CreatedAtLT(expired)).Exec(context.Background())
-		if err != nil {
-			log.Err(err).Msg("Envelope Delete")
-			return
-		}
-		if count > 0 {
-			log.Info().Msgf("clean up expired %d", count)
-		}
 	}, time.Hour*24)
 }
 
