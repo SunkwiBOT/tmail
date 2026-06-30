@@ -25,6 +25,7 @@ function Detail({
   lang: string
 }) {
   const divRef = useRef<HTMLDivElement>(null)
+  const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const controller = useRef<AbortController>(null)
   const [attachments, setAttachments] = useState<Attachment[]>([])
@@ -32,6 +33,7 @@ function Detail({
   const t = useMemo(() => useTranslations(lang as language), [])
 
   function onOpenChange(open: boolean) {
+    setOpen(open)
     if (open) {
       setLoading(true)
       controller.current = new AbortController()
@@ -55,9 +57,12 @@ function Detail({
   }
 
   return (
-    <AlertDialog onOpenChange={onOpenChange}>
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogTrigger asChild>{children}</AlertDialogTrigger>
-      <AlertDialogContent className="flex max-h-11/12 flex-col sm:max-w-4xl">
+      <AlertDialogContent
+        className="flex max-h-11/12 flex-col sm:max-w-4xl"
+        onOverlayClick={() => onOpenChange(false)}
+      >
         <AlertDialogHeader className="relative">
           <AlertDialogTitle>{envelope.subject}</AlertDialogTitle>
           <AlertDialogDescription className="flex flex-col justify-between sm:flex-row">

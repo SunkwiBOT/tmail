@@ -44,11 +44,14 @@ function AlertDialogOverlay({
 
 function AlertDialogContent({
   className,
+  onOverlayClick,
   ...props
-}: React.ComponentProps<typeof AlertDialogPrimitive.Content>) {
+}: React.ComponentProps<typeof AlertDialogPrimitive.Content> & {
+  onOverlayClick?: React.MouseEventHandler<HTMLDivElement>
+}) {
   return (
     <AlertDialogPortal>
-      <AlertDialogOverlay />
+      <AlertDialogOverlay onClick={onOverlayClick} />
       <AlertDialogPrimitive.Content
         data-slot="alert-dialog-content"
         className={cn(
