@@ -43,9 +43,6 @@ function EditAddress({
 
   function onInputChange(value: string) {
     value = value.replace(/[^a-zA-Z0-9-_.]/g, "")
-    if (value.length > 12) {
-      value = value.slice(0, 12)
-    }
     setAddress(`${value}@${address!.split("@")[1]}`)
   }
 
