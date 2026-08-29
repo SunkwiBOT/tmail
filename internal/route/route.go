@@ -20,6 +20,7 @@ func Register(e *echo.Echo, cfg *config.Config) {
 		protected = g.Group("", requireTurnstile(cfg))
 	}
 	protected.GET("/fetch", server.Wrap(api.Fetch))
+	protected.GET("/fetch/page", server.Wrap(api.FetchPage))
 	protected.GET("/fetch/latest", server.WrapReply(api.FetchLatest))
 	protected.GET("/fetch/:id", server.Wrap(api.FetchDetail))
 	protected.GET("/download/:id", server.WrapReply(api.Download))

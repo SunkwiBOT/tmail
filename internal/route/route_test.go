@@ -33,6 +33,13 @@ func TestRegisterTurnstileRoutes(t *testing.T) {
 	})
 }
 
+func TestRegisterFetchPageRoute(t *testing.T) {
+	e := echo.New()
+	Register(e, &config.Config{})
+
+	assertRoute(t, e, http.MethodGet, "/api/fetch/page", true)
+}
+
 func TestTurnstileProtection(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		cfg := &config.Config{DomainList: []string{"example.com"}}

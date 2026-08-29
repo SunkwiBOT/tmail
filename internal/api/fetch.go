@@ -17,6 +17,8 @@ import (
 
 const subAll = "all"
 
+const fetchPageSize = 10
+
 type ReqFetch struct {
 	To    string `query:"to"`
 	Since string `query:"since"`
@@ -53,6 +55,69 @@ func Fetch(ctx context.Context, req ReqFetch) ([]*ent.Envelope, error) {
 		return nil, err
 	}
 	return list, nil
+}
+
+type ReqFetchPage struct {
+	To   string `query:"to"`
+	Page int    `query:"page"`
+}
+
+type FetchPagination struct {
+	Page       int `json:"page"`
+	Total      int `json:"total"`
+	TotalPages int `json:"total_pages"`
+}
+
+type FetchPageResp struct {
+	Envelopes  []*ent.Envelope `json:"envelopes"`
+	Pagination FetchPagination `json:"pagination"`
+}
+
+func FetchPage(ctx context.Context, req ReqFetchPage) (*FetchPageResp, error) {
+	if req.To == "" || req.Page < 0 {
+		return nil, server.BadParam()
+	}
+
+	page := req.Page
+	if page == 0 {
+		page = 1
+	}
+
+	admin := req.To == Config(ctx).AdminAddress
+	countQuery := DB(ctx).Envelope.Query()
+	if !admin {
+		countQuery.Where(envelope.To(req.To))
+	}
+	total, err := countQuery.Count(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	totalPages := max(1, (total+fetchPageSize-1)/fetchPageSize)
+	page = min(page, totalPages)
+
+	query := DB(ctx).Envelope.Query().
+		Select(envelope.FieldID, envelope.FieldTo, envelope.FieldFrom, envelope.FieldSubject, envelope.FieldCreatedAt).
+		Order(ent.Desc(envelope.FieldID)).
+		Offset((page - 1) * fetchPageSize).
+		Limit(fetchPageSize)
+	if !admin {
+		query.Where(envelope.To(req.To))
+	}
+
+	list, err := query.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &FetchPageResp{
+		Envelopes: list,
+		Pagination: FetchPagination{
+			Page:       page,
+			Total:      total,
+			TotalPages: totalPages,
+		},
+	}, nil
 }
 
 type MailDetail struct {
