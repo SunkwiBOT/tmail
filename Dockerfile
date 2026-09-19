@@ -34,5 +34,4 @@ COPY --from=builder /app/tmail-smtpd .
 
 ENV HOST=127.0.0.1
 ENV PORT=3000
-EXPOSE 25 3000
 CMD ["/app/tmail"]
