@@ -6,12 +6,18 @@ import (
 	"tmail/internal/api"
 
 	"github.com/labstack/echo/v5"
+	"github.com/labstack/echo/v5/middleware"
 	"github.com/sunls24/gox/server"
 )
 
 func Register(e *echo.Echo, cfg *config.Config) {
 	g := e.Group("/api")
-	g.POST("/report", server.WrapReplyResp(api.Report))
+	g.POST(
+		"/report",
+		server.WrapReplyResp(api.Report),
+		middleware.BodyLimit(cfg.ReportMaxBodySize),
+		requireReportHMAC(cfg),
+	)
 	g.GET("/turnstile/status", server.WrapResp(api.TurnstileStatus))
 
 	protected := g
@@ -30,6 +36,9 @@ func Register(e *echo.Echo, cfg *config.Config) {
 func requireTurnstile(cfg *config.Config) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
+			if cfg.APIKey != "" && c.Request().Header.Get("X-API-Key") == cfg.APIKey {
+				return next(c)
+			}
 			if !api.TurnstileVerified(c.Request(), cfg) {
 				return c.JSON(http.StatusUnauthorized, server.Envelope{
 					Code:    -1,

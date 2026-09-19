@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"tmail/ent"
 
 	"github.com/jhillyerd/enmime/v2"
-	"github.com/rs/zerolog/log"
 	"github.com/sunls24/gox"
 	"github.com/sunls24/gox/notifier"
 	"github.com/sunls24/gox/server"
@@ -15,7 +17,7 @@ import (
 
 func Report(ctx context.Context) (*server.Reply, error) {
 	ec := server.EchoContext(ctx)
-	to := ec.QueryParam("to")
+	to := validUTF8(ec.QueryParam("to"))
 	if to == "" {
 		return nil, server.BadParam()
 	}
@@ -23,8 +25,8 @@ func Report(ctx context.Context) (*server.Reply, error) {
 	if err != nil {
 		return nil, err
 	}
-	subject := envelope.GetHeader("subject")
-	from := envelope.GetHeader("from")
+	subject := validUTF8(envelope.GetHeader("subject"))
+	from := validUTF8(envelope.GetHeader("from"))
 	if from == "" {
 		return server.OK(nil), nil
 	}
@@ -32,8 +34,9 @@ func Report(ctx context.Context) (*server.Reply, error) {
 	if content == "" {
 		content = envelope.Text
 	}
+	content = validUTF8(content)
 
-	log.Debug().Msgf("Report: %s <- %s: %s", to, from, subject)
+	slog.Debug("Report", "to", to, "from", from, "subject", subject)
 	e, err := DB(ctx).Envelope.Create().
 		SetTo(to).
 		SetFrom(from).
@@ -42,12 +45,11 @@ func Report(ctx context.Context) (*server.Reply, error) {
 		Save(ctx)
 	if err == nil {
 		notifyEnvelope := envelopeSummary(e)
+		attachmentCtx := context.WithoutCancel(ctx)
 		gox.SafeGo(func() {
+			saveAttachment(attachmentCtx, envelope.Attachments, to, e.ID)
 			notifier.Notify(e.To, notifyEnvelope)
 			notifier.Notify(subAll, notifyEnvelope)
-		})
-		gox.SafeGo(func() {
-			saveAttachment(context.WithoutCancel(ctx), envelope.Attachments, to, e.ID)
 		})
 	}
 	return server.OK(nil), err
@@ -63,6 +65,10 @@ func envelopeSummary(e *ent.Envelope) *ent.Envelope {
 	}
 }
 
+func validUTF8(s string) string {
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
 func saveAttachment(ctx context.Context, attachments []*enmime.Part, to string, ownerID int) {
 	const maxSize = 200000000 // 200M
 	if len(attachments) == 0 {
@@ -72,33 +78,34 @@ func saveAttachment(ctx context.Context, attachments []*enmime.Part, to string, 
 	cfg := Config(ctx)
 	dir := filepath.Join(cfg.BaseDir, gox.MD5(to)[:16])
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Err(err).Msg("MkdirAll")
+		slog.Error("MkdirAll", "err", err)
 		return
 	}
 
-	for _, a := range attachments {
+	for i, a := range attachments {
 		if a.FileName == "" || len(a.Content) > maxSize {
 			continue
 		}
 
-		name := gox.MD5(a.FileName)
+		filename := validUTF8(a.FileName)
+		name := gox.MD5(fmt.Sprintf("%d:%d:%s", ownerID, i, filename))
 		fp := filepath.Join(dir, name)
-		log.Info().Msgf("Attachment: %s -> %s", a.FileName, fp)
+		slog.Info("Attachment", "filename", filename, "filepath", fp)
 		if err := os.WriteFile(fp, a.Content, 0o644); err != nil {
-			log.Err(err).Msg("WriteFile")
+			slog.Error("WriteFile", "err", err)
 			continue
 		}
 
 		_, err := DB(ctx).Attachment.Create().
 			SetID(filepath.Base(dir) + name[:6] + gox.RandStr(4)).
-			SetFilename(a.FileName).
+			SetFilename(filename).
 			SetFilepath(fp).
-			SetContentType(a.ContentType).
+			SetContentType(validUTF8(a.ContentType)).
 			SetOwnerID(ownerID).
 			Save(ctx)
 		if err != nil {
 			_ = os.Remove(fp)
-			log.Err(err).Msg("Attachment Save")
+			slog.Error("Attachment Save", "err", err)
 		}
 	}
 }

@@ -1,15 +1,20 @@
 import Actions from "@/components/Actions.tsx"
 import Detail from "@/components/Detail.tsx"
-import MailboxPagination from "@/components/MailboxPagination.tsx"
+import MailboxPagination, {
+  MailboxPaginationSkeleton,
+} from "@/components/MailboxPagination.tsx"
 import Mounted from "@/components/Mounted.tsx"
+import { Button } from "@/components/ui/button.tsx"
 import { Skeleton } from "@/components/ui/skeleton.tsx"
+import { toast } from "@/components/ui/toast"
 import { type language, useTranslations } from "@/i18n/ui.ts"
 import { ABORT_SAFE } from "@/lib/constant.ts"
+import { fetchError } from "@/lib/fetch-error.ts"
 import { $address, initStore } from "@/lib/store/store.ts"
 import type { Envelope, FetchPage, FetchPagination } from "@/lib/types.ts"
+import usePaginatedCollection from "@/lib/use-paginated-collection.ts"
 import {
   apiFetch,
-  fetchError,
   fmtDate,
   fmtFrom,
   fmtString,
@@ -22,12 +27,14 @@ import {
   ExternalLink,
   Frown,
   Loader,
-  RotateCw,
+  RefreshCw,
 } from "lucide-react"
-import { useEffect, useMemo, useRef, useState } from "react"
-import { toast } from "sonner"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 const pageSize = 10
+const initialRetryDelayMs = 2_000
+const maxRetryDelayMs = 30_000
+const skeletonRows = 5
 const initialPagination: FetchPagination = {
   page: 1,
   total: 0,
@@ -42,64 +49,133 @@ function fetchMailboxPage(address: string, page: number, signal: AbortSignal) {
   return apiFetch<FetchPage>(`/api/fetch/page?${params}`, { signal })
 }
 
+function MailboxListSkeleton() {
+  return (
+    <>
+      {Array.from({ length: skeletonRows }, (_, index) => (
+        <div aria-hidden={true} className="space-y-2 px-4 py-3" key={index}>
+          <Skeleton className="h-4 w-2/3" />
+          <div className="flex items-center justify-between">
+            <Skeleton className="h-3 w-1/3" />
+            <Skeleton className="h-3 w-20" />
+          </div>
+        </div>
+      ))}
+    </>
+  )
+}
+
 function Content({ lang }: { lang: string }) {
-  const [loading, setLoading] = useState(true)
-  const [pageLoading, setPageLoading] = useState(false)
-  const [envelopes, setEnvelopes] = useState<Envelope[]>([])
-  const [pagination, setPagination] =
-    useState<FetchPagination>(initialPagination)
-  const controller = useRef<AbortController | null>(null)
-  const currentPage = useRef(1)
-  const list = useRef<HTMLDivElement | null>(null)
-
+  const [ready, setReady] = useState(false)
   const address = useStore($address)
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const currentPageRef = useRef(1)
+  const knownIdsRef = useRef<Set<number>>(new Set())
+  const t = useTranslations(lang as language)
 
-  const t = useMemo(() => useTranslations(lang as language), [lang])
+  const fetchPage = useCallback(
+    async (page: number, signal: AbortSignal) => {
+      const result = await fetchMailboxPage(address!, page, signal)
+      return {
+        items: result.envelopes,
+        pagination: result.pagination,
+      }
+    },
+    [address]
+  )
+
+  const {
+    hasLoadedTotal,
+    isLoading,
+    items: envelopes,
+    loadError,
+    loadPage,
+    pagination,
+    reset,
+    setItems,
+    setPagination,
+  } = usePaginatedCollection<Envelope, number, FetchPagination>({
+    fetchPage,
+    initialPagination,
+    onError: fetchError,
+  })
 
   useEffect(() => {
-    apiFetch<string[]>("/api/domain")
-      .then((domainList) => initStore(domainList))
-      .catch(fetchError)
-  }, [])
+    currentPageRef.current = pagination.page
+  }, [pagination.page])
 
   useEffect(() => {
-    if (!address) {
+    const onReady = () => setReady(true)
+    if (document.body.hasAttribute("data-turnstile-verified")) {
+      onReady()
       return
     }
 
-    const currentController = new AbortController()
-    controller.current = currentController
+    document.addEventListener("tmail:ready", onReady, { once: true })
+    return () => document.removeEventListener("tmail:ready", onReady)
+  }, [])
+
+  useEffect(() => {
+    if (!ready) {
+      return
+    }
+
+    apiFetch<string[]>("/api/domain")
+      .then((domainList) => initStore(domainList))
+      .catch(fetchError)
+  }, [ready])
+
+  useEffect(() => {
+    if (!ready || !address) {
+      return
+    }
+
+    const pollController = new AbortController()
     let latestId = 0
 
-    async function pollLatest() {
-      while (!currentController.signal.aborted) {
+    async function poll() {
+      let retryDelay = initialRetryDelayMs
+      while (!pollController.signal.aborted) {
         try {
           const params = new URLSearchParams({
             to: address,
             id: String(latestId),
           })
           const res = await fetch(`/api/fetch/latest?${params}`, {
-            signal: currentController.signal,
+            signal: pollController.signal,
           })
+          if (pollController.signal.aborted) {
+            return
+          }
+          if (res.status === 401) {
+            setReady(false)
+            document.dispatchEvent(new Event("tmail:verification-expired"))
+            return
+          }
           if (res.status === 204) {
+            retryDelay = initialRetryDelayMs
             continue
           }
 
           const envelope = await unwrapApi<Envelope>(res)
-          if (currentController.signal.aborted || envelope.id <= latestId) {
+          if (pollController.signal.aborted) {
+            return
+          }
+          retryDelay = initialRetryDelayMs
+          latestId = Math.max(latestId, envelope.id)
+          if (knownIdsRef.current.has(envelope.id)) {
             continue
           }
 
-          latestId = envelope.id
+          knownIdsRef.current.add(envelope.id)
           envelope.animate = true
-          if (currentPage.current === 1) {
-            setEnvelopes((current) =>
-              [
-                envelope,
-                ...current.filter((item) => item.id !== envelope.id),
-              ].slice(0, pageSize)
-            )
-          }
+          setItems((current) => {
+            const deduped = current.filter((item) => item.id !== envelope.id)
+            if (currentPageRef.current === 1) {
+              return [envelope, ...deduped].slice(0, pageSize)
+            }
+            return deduped
+          })
           setPagination((current) => {
             const total = current.total + 1
             return {
@@ -108,102 +184,77 @@ function Content({ lang }: { lang: string }) {
               total_pages: Math.max(1, Math.ceil(total / pageSize)),
             }
           })
-          toast.success(fmtString(t("receiveNew"), envelope.from))
+          toast.add({
+            title: fmtString(t("receiveNew"), envelope.from),
+            type: "success",
+          })
         } catch (error) {
-          if (currentController.signal.aborted) {
+          if (pollController.signal.aborted) {
             return
           }
           fetchError(error)
-          await new Promise((resolve) => setTimeout(resolve, 1000))
+          const delay = retryDelay + Math.random() * 500
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          retryDelay = Math.min(retryDelay * 2, maxRetryDelayMs)
         }
       }
     }
 
     async function start() {
-      try {
-        const result = await fetchMailboxPage(
-          address,
-          1,
-          currentController.signal
-        )
-        if (currentController.signal.aborted) {
-          return
-        }
-
-        latestId = result.envelopes[0]?.id ?? 0
-        currentPage.current = result.pagination.page
-        setEnvelopes(result.envelopes)
-        setPagination(result.pagination)
-        void pollLatest()
-      } catch (error) {
-        if (!currentController.signal.aborted) {
-          fetchError(error)
-        }
-      } finally {
-        if (!currentController.signal.aborted) {
-          setLoading(false)
-        }
-      }
-    }
-
-    setLoading(true)
-    setPageLoading(false)
-    setEnvelopes([])
-    setPagination(initialPagination)
-    currentPage.current = 1
-    void start()
-
-    return () => {
-      currentController.abort(ABORT_SAFE)
-      if (controller.current === currentController) {
-        controller.current = null
-      }
-    }
-  }, [address, lang])
-
-  async function changePage(page: number) {
-    const currentController = controller.current
-    if (!address || !currentController || pageLoading) {
-      return
-    }
-
-    setPageLoading(true)
-    try {
-      const result = await fetchMailboxPage(
-        address,
-        page,
-        currentController.signal
-      )
-      if (
-        currentController.signal.aborted ||
-        controller.current !== currentController
-      ) {
+      const result = await loadPage(1)
+      if (!result || pollController.signal.aborted) {
         return
       }
 
-      currentPage.current = result.pagination.page
-      setEnvelopes(result.envelopes)
-      setPagination(result.pagination)
-      list.current?.scrollTo({ top: 0 })
-    } catch (error) {
-      if (!currentController.signal.aborted) {
-        fetchError(error)
-      }
-    } finally {
-      if (controller.current === currentController) {
-        setPageLoading(false)
-      }
+      knownIdsRef.current = new Set(result.items.map((item) => item.id))
+      latestId = result.items[0]?.id ?? 0
+      void poll()
     }
-  }
+
+    reset()
+    knownIdsRef.current = new Set()
+    void start()
+
+    return () => {
+      pollController.abort(ABORT_SAFE)
+    }
+  }, [address, lang, loadPage, ready, reset, setItems, setPagination])
+
+  const changePage = useCallback(
+    async (page: number) => {
+      const result = await loadPage(page)
+      if (!result) {
+        return
+      }
+
+      for (const envelope of result.items) {
+        knownIdsRef.current.add(envelope.id)
+      }
+      listRef.current?.scrollTo({ top: 0 })
+    },
+    [loadPage]
+  )
+
+  const retry = useCallback(() => {
+    void loadPage(pagination.page)
+  }, [loadPage, pagination.page])
 
   function copyToClipboard() {
     navigator.clipboard
       .writeText(address)
-      .then(() => toast.success(t("copy") + " " + address))
-      .catch((e) => toast.error(e.message ?? e))
+      .then(() =>
+        toast.add({ title: t("copy") + " " + address, type: "success" })
+      )
+      .catch((e) => toast.add({ title: e.message ?? String(e), type: "error" }))
   }
 
-  const hasPagination = !loading && pagination.total_pages > 1
+  const showInitialSkeleton =
+    !loadError && (!ready || (!hasLoadedTotal && isLoading))
+  const hasPagination = hasLoadedTotal && pagination.total_pages > 1
+  const showPaginationArea = showInitialSkeleton || hasPagination
+  const showLoadError = loadError && envelopes.length === 0 && !isLoading
+  const showEmpty =
+    !showInitialSkeleton && envelopes.length === 0 && !showLoadError
 
   return (
     <div className="flex w-full flex-col pb-4">
@@ -218,12 +269,14 @@ function Content({ lang }: { lang: string }) {
               <span className="font-mono font-semibold">{address}</span>
             </Mounted>
           </div>
-          <div
+          <button
+            type="button"
+            aria-label={t("copyAddress")}
             onClick={copyToClipboard}
-            className="hover:bg-sidebar flex items-center self-stretch transition-colors hover:cursor-pointer hover:border-r"
+            className="hover:bg-sidebar flex items-center self-stretch border-0 bg-transparent transition-colors hover:cursor-pointer hover:border-r"
           >
             <ClipboardCopy className="mx-2" size={20} strokeWidth={1.8} />
-          </div>
+          </button>
           <div className="flex-1" />
           <div className="text-muted-foreground hidden font-medium sm:inline">
             {t("realTime")}
@@ -232,63 +285,72 @@ function Content({ lang }: { lang: string }) {
         </div>
       </div>
       <div
-        ref={list}
+        ref={listRef}
+        aria-busy={isLoading}
         className={clsx(
           "min-h-0 divide-y overflow-y-auto border",
-          hasPagination ? "border-b-0" : "rounded-b-sm"
+          showPaginationArea ? "border-b-0" : "rounded-b-sm"
         )}
       >
-        {envelopes.length === 0 && (
-          <div className="text-muted-foreground flex items-center justify-center gap-1 py-5.5">
-            {loading ? (
-              <>
-                <RotateCw className="animate-spin" size={20} />
-                <span>{t("listLoading")}</span>
-              </>
-            ) : (
-              <>
-                <Frown size={20} />
-                <span>{t("listEmpty")}</span>
-              </>
-            )}
+        {showInitialSkeleton ? (
+          <MailboxListSkeleton />
+        ) : showLoadError ? (
+          <div className="text-muted-foreground flex flex-col items-center justify-center gap-2 py-6">
+            <Frown size={20} />
+            <span>{t("listLoadError")}</span>
+            <Button variant="outline" size="sm" onClick={retry}>
+              <RefreshCw />
+              {t("retry")}
+            </Button>
           </div>
+        ) : showEmpty ? (
+          <div className="text-muted-foreground flex items-center justify-center gap-1 py-5.5">
+            <Frown size={20} />
+            <span>{t("listEmpty")}</span>
+          </div>
+        ) : (
+          envelopes.map((envelope) => (
+            <Detail lang={lang} key={envelope.id} envelope={envelope}>
+              <button
+                type="button"
+                className={clsx(
+                  "hover:bg-secondary group text-muted-foreground block w-full bg-transparent px-4 py-2 text-left transition-colors duration-300 hover:cursor-pointer",
+                  envelope.animate && "animate-in slide-in-from-right"
+                )}
+              >
+                <div className="flex items-center space-y-1">
+                  <span className="text-foreground">{envelope.subject}</span>
+                  <ExternalLink
+                    size={16}
+                    className="invisible mx-2 hidden group-hover:visible sm:block"
+                  />
+                  <div className="flex-1" />
+                  {envelope.to != address && <span>{envelope.to}</span>}
+                </div>
+                <div className="flex justify-between text-sm">
+                  <div className="truncate">{fmtFrom(envelope.from)}</div>
+                  <div className="shrink-0">{fmtDate(envelope.created_at)}</div>
+                </div>
+              </button>
+            </Detail>
+          ))
         )}
-        {envelopes.map((envelope) => (
-          <Detail lang={lang} key={envelope.id} envelope={envelope}>
-            <div
-              className={clsx(
-                "hover:bg-secondary group text-muted-foreground space-y-1 px-4 py-2 transition-colors duration-300 hover:cursor-pointer",
-                envelope.animate && "animate-in slide-in-from-right"
-              )}
-            >
-              <div className="flex items-center">
-                <span className="text-foreground">{envelope.subject}</span>
-                <ExternalLink
-                  size={16}
-                  className="invisible mx-2 hidden group-hover:visible sm:block"
-                />
-                <div className="flex-1" />
-                {envelope.to != address && <span>{envelope.to}</span>}
-              </div>
-              <div className="flex justify-between text-sm">
-                <div className="truncate">{fmtFrom(envelope.from)}</div>
-                <div className="shrink-0">{fmtDate(envelope.created_at)}</div>
-              </div>
-            </div>
-          </Detail>
-        ))}
       </div>
-      {hasPagination && (
+      {showInitialSkeleton ? (
+        <div className="rounded-b-sm border px-3 py-3">
+          <MailboxPaginationSkeleton />
+        </div>
+      ) : hasPagination ? (
         <div className="rounded-b-sm border px-3 py-3">
           <MailboxPagination
             currentPage={pagination.page}
-            isLoading={pageLoading}
+            isLoading={isLoading}
             lang={lang}
             onPageChange={changePage}
             totalPages={pagination.total_pages}
           />
         </div>
-      )}
+      ) : null}
       <div className="flex-1" />
     </div>
   )
